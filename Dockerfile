@@ -1,7 +1,5 @@
-# Use Python 3.12 slim image as base
 FROM python:3.12-slim
 
-# Set working directory
 WORKDIR /app
 
 # Install system dependencies
@@ -11,25 +9,19 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY main.py .
-COPY index.html .
-COPY entrypoint.sh .
+COPY *.html ./
 
-# Copy environment file if it exists
-COPY .env* ./
+# Create uploads directory
+RUN mkdir -p uploads
 
-# Make entrypoint script executable
-RUN chmod +x entrypoint.sh
+# Expose port 7860 (Hugging Face requirement)
+EXPOSE 7860
 
-# Expose the port the app runs on
-EXPOSE 8000
-
-# Command to run the application
-CMD ["./entrypoint.sh"]
+# Run the application on port 7860
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
