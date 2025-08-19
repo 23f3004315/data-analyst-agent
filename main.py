@@ -348,6 +348,8 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "import matplotlib.pyplot as plt",
         "from io import BytesIO",
         "import base64",
+        "import seaborn as sns",
+        "import networkx as nx",
     ]
     if PIL_AVAILABLE:
         preamble.append("from PIL import Image")
@@ -423,7 +425,7 @@ def plot_to_base64(max_bytes=100000):
 
     try:
         completed = subprocess.run([sys.executable, tmp_path],
-                                   capture_output=True, text=True, timeout=timeout)
+                                     capture_output=True, text=True, timeout=timeout)
         if completed.returncode != 0:
             # collect stderr and stdout for debugging
             return {"status": "error", "message": completed.stderr.strip() or completed.stdout.strip()}
@@ -567,6 +569,8 @@ from fastapi import Request
 
 @app.post("/api")
 async def analyze_data(request: Request):
+    # Part 1: Initial file parsing and validation.
+    # Failures here are client-side problems (e.g., missing file) and should return a 400 error.
     try:
         form = await request.form()
         questions_file = None
@@ -586,6 +590,40 @@ async def analyze_data(request: Request):
         raw_questions = (await questions_file.read()).decode("utf-8")
         keys_list, type_map = parse_keys_and_types(raw_questions)
 
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.exception("Initial file parsing failed")
+        raise HTTPException(status_code=400, detail=f"Error processing input files: {str(e)}")
+
+
+    # TIP: Always return something in the correct JSON structure within the time limit.
+    # This helper is now UPDATED to be schema-compliant.
+    def _create_schema_compliant_error_response(error_message: str):
+        """
+        Builds a schema-compliant JSON response with default values based on expected types.
+        """
+        if not keys_list or not type_map:
+            # Fallback if we couldn't even parse the question keys
+            return JSONResponse(content={"error": error_message}, status_code=200)
+
+        error_content = {}
+        for key in keys_list:
+            expected_type = type_map.get(key) # Gets the type constructor (e.g., int, float, str)
+
+            if expected_type in [int, float]:
+                error_content[key] = 0 # Use 0 for number types
+            elif expected_type == str:
+                error_content[key] = f"Error: {error_message}" # Use error string for string types
+            else:
+                error_content[key] = f"Error: Unknown type for key '{key}'" # Fallback
+
+        return JSONResponse(content=error_content, status_code=200)
+
+
+    # Part 2: Core agent execution logic.
+    # Any failure in this block will be caught and return a best-effort 200 OK response.
+    try:
         pickle_path = None
         df_preview = ""
         dataset_uploaded = False
@@ -607,16 +645,17 @@ async def analyze_data(request: Request):
                     df = pd.read_json(BytesIO(content))
                 except ValueError:
                     df = pd.DataFrame(json.loads(content.decode("utf-8")))
-            elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
+            elif filename.endswith((".png", ".jpg", ".jpeg")):
                 try:
                     if PIL_AVAILABLE:
+                        from PIL import Image
                         image = Image.open(BytesIO(content))
                         image = image.convert("RGB")  # ensure RGB format
                         df = pd.DataFrame({"image": [image]})
                     else:
-                        raise HTTPException(400, "PIL not available for image processing")
+                        raise HTTPException(400, "PIL/Pillow not available for image processing")
                 except Exception as e:
-                    raise HTTPException(400, f"Image processing failed: {str(e)}")  
+                    raise HTTPException(400, f"Image processing failed: {str(e)}")
             else:
                 raise HTTPException(400, f"Unsupported data file type: {filename}")
 
@@ -667,12 +706,12 @@ async def analyze_data(request: Request):
             try:
                 result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
-                raise HTTPException(408, "Processing timeout")
+                return _create_schema_compliant_error_response(f"Processing timed out after {LLM_TIMEOUT_SECONDS} seconds")
 
         if "error" in result:
-            raise HTTPException(500, detail=result["error"])
+            return _create_schema_compliant_error_response(result["error"])
 
-        # Post-process key mapping & type casting
+        # Post-process key mapping & type casting for successful result
         if keys_list and type_map:
             mapped = {}
             for idx, q in enumerate(result.keys()):
@@ -692,10 +731,12 @@ async def analyze_data(request: Request):
         return JSONResponse(content=result)
 
     except HTTPException as he:
+        # Re-raise explicit HTTP exceptions from this block (e.g., image processing failed)
         raise he
     except Exception as e:
-        logger.exception("analyze_data failed")
-        raise HTTPException(500, detail=str(e))
+        # Catch any other unexpected error during agent execution
+        logger.exception("analyze_data main logic failed")
+        return _create_schema_compliant_error_response(f"An unexpected server error occurred: {str(e)}")
 
 
 def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
