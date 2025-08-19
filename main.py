@@ -342,6 +342,8 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
     # create file content
     preamble = [
         "import json, sys, gc",
+        "import seaborn as sns",
+        "import networkx as nx",
         "import pandas as pd, numpy as np",
         "import matplotlib",
         "matplotlib.use('Agg')",
