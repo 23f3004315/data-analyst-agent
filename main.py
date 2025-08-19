@@ -81,7 +81,7 @@ class LLMWithFallback:
         self.temperature = temperature
         self.slow_keys_log = defaultdict(list)
         self.failing_keys_log = defaultdict(int)
-        self.current_llm = None  # placeholder for actual ChatGoogleGenerativeAI instance
+        self.current_llm = None # placeholder for actual ChatGoogleGenerativeAI instance
 
     def _get_llm_instance(self):
         last_error = None
@@ -297,7 +297,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     tables = pd.read_html(response.text)
 
     if tables:
-        df = tables[0]  # Take first table
+        df = tables[0] # Take first table
         df.columns = [str(c).strip() for c in df.columns]
         
         # Ensure all columns are unique and string
@@ -314,7 +314,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
 
         # Try to detect possible "keys" from text like Runtime, Genre, etc.
         detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
-        df = pd.DataFrame([{}])  # start empty
+        df = pd.DataFrame([{}]) # start empty
         for col in detected_cols:
             df[col] = None
 
@@ -348,8 +348,6 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "import matplotlib.pyplot as plt",
         "from io import BytesIO",
         "import base64",
-        "import seaborn as sns",
-        "import networkx as nx",
     ]
     if PIL_AVAILABLE:
         preamble.append("from PIL import Image")
@@ -450,17 +448,11 @@ def plot_to_base64(max_bytes=100000):
 # -----------------------------
 # LLM agent setup
 # -----------------------------
-# llm = ChatGoogleGenerativeAI(
-#     model=os.getenv("GOOGLE_MODEL", "gemini-2.5-pro"),
-#     temperature=0,
-#     google_api_key=os.getenv("GOOGLE_API_KEY")
-# )
-# -------------------- Initialize LLM --------------------
 llm = LLMWithFallback(temperature=0)
 # -----------------------------
 
 # Tools list for agent (LangChain tool decorator returns metadata for the LLM)
-tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent will still produce code
+tools = [scrape_url_to_dataframe] # we only expose scraping as a tool; agent will still produce code
 
 # Prompt: instruct agent to call the tool and output JSON only
 prompt = ChatPromptTemplate.from_messages([
@@ -489,7 +481,7 @@ You must:
 
 agent = create_tool_calling_agent(
     llm=llm,
-    tools=[scrape_url_to_dataframe],  # let the agent call tools if it wants; we will also pre-process scrapes
+    tools=[scrape_url_to_dataframe], # let the agent call tools if it wants; we will also pre-process scrapes
     prompt=prompt
 )
 
@@ -507,64 +499,6 @@ agent_executor = AgentExecutor(
 # -----------------------------
 # Runner: orchestrates agent -> pre-scrape inject -> execute
 # -----------------------------
-def run_agent_safely(llm_input: str) -> Dict:
-    """
-    1. Run the agent_executor.invoke to get LLM output
-    2. Extract JSON, get 'code' and 'questions'
-    3. Detect scrape_url_to_dataframe("...") calls in code, run them here, pickle df and inject before exec
-    4. Execute the code in a temp file and return results mapping questions -> answers
-    """
-    try:
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
-        if not raw_out:
-            return {"error": f"Agent returned no output. Full response: {response}"}
-
-        parsed = clean_llm_output(raw_out)
-        if "error" in parsed:
-            return parsed
-
-        if not isinstance(parsed, dict) or "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response format: {parsed}"}
-
-        code = parsed["code"]
-        questions: List[str] = parsed["questions"]
-
-        # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
-        urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
-        pickle_path = None
-        if urls:
-            # For now support only the first URL (agent may code multiple scrapes; you can extend this)
-            url = urls[0]
-            tool_resp = scrape_url_to_dataframe(url)
-            if tool_resp.get("status") != "success":
-                return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-            # create df and pickle it
-            df = pd.DataFrame(tool_resp["data"])
-            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            temp_pkl.close()
-            df.to_pickle(temp_pkl.name)
-            pickle_path = temp_pkl.name
-            # Make sure agent's code can reference df/data: we will inject the pickle loader in the temp script
-
-        # Execute code in temp python script
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
-        if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message', exec_result)}", "raw": exec_result.get("raw")}
-
-        # exec_result['result'] should be results dict
-        results_dict = exec_result.get("result", {})
-        # Map to original questions (they asked to use exact question strings)
-        output = {}
-        for q in questions:
-            output[q] = results_dict.get(q, "Answer not found")
-        return output
-
-    except Exception as e:
-        logger.exception("run_agent_safely failed")
-        return {"error": str(e)}
-
-
 from fastapi import Request
 
 @app.post("/api")
@@ -577,7 +511,7 @@ async def analyze_data(request: Request):
         data_file = None
 
         for key, val in form.items():
-            if hasattr(val, "filename") and val.filename:  # it's a file
+            if hasattr(val, "filename") and val.filename: # it's a file
                 fname = val.filename.lower()
                 if fname.endswith(".txt") and questions_file is None:
                     questions_file = val
@@ -645,12 +579,12 @@ async def analyze_data(request: Request):
                     df = pd.read_json(BytesIO(content))
                 except ValueError:
                     df = pd.DataFrame(json.loads(content.decode("utf-8")))
-            elif filename.endswith((".png", ".jpg", ".jpeg")):
+            elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
                 try:
                     if PIL_AVAILABLE:
                         from PIL import Image
                         image = Image.open(BytesIO(content))
-                        image = image.convert("RGB")  # ensure RGB format
+                        image = image.convert("RGB") # ensure RGB format
                         df = pd.DataFrame({"image": [image]})
                     else:
                         raise HTTPException(400, "PIL/Pillow not available for image processing")
@@ -842,7 +776,7 @@ import tempfile
 import os
 import time 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse    
+from fastapi.responses import JSONResponse, HTMLResponse      
 
 # ---- Configuration for diagnostics (tweak as needed) ----
 DIAG_NETWORK_TARGETS = {
@@ -851,9 +785,9 @@ DIAG_NETWORK_TARGETS = {
     "OpenAI": "https://api.openai.com",
     "GitHub": "https://api.github.com",
 }
-DIAG_LLM_KEY_TIMEOUT = 30  # seconds per key/model simple ping test (sync tests run in threadpool)
+DIAG_LLM_KEY_TIMEOUT = 30 # seconds per key/model simple ping test (sync tests run in threadpool)
 DIAG_PARALLELISM = 6       # how many thread workers for sync checks
-RUN_LONGER_CHECKS = False  # Playwright/duckdb tests run only if true (they can be slow)
+RUN_LONGER_CHECKS = False # Playwright/duckdb tests run only if true (they can be slow)
 
 # Use existing GEMINI_KEYS / MODEL_HIERARCHY from your app. If not defined, create empty lists.
 try:
