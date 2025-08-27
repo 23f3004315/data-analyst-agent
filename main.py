@@ -29,6 +29,10 @@ import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import time
+from collections import defaultdict
+import itertools
+import threading
 
 # Optional image conversion
 try:
@@ -37,9 +41,9 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-# LangChain / LLM imports (keep as you used)
+# LangChain / LLM imports
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 
@@ -49,67 +53,94 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-# -------------------- Robust Gemini LLM with fallback --------------------
-from collections import defaultdict
-import time
-from langchain_google_genai import ChatGoogleGenerativeAI
+# -------------------- Robust Groq LLM with fallback & multiple API keys --------------------
 
-# Config
-GEMINI_KEYS = [os.getenv(f"gemini_api_{i}") for i in range(1, 11)]
-GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
+# Load multiple API keys from a comma-separated environment variable
+GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEYS")
+if not GROQ_API_KEYS_STR:
+    raise RuntimeError("No Groq API keys found. Please set GROQ_API_KEYS in your environment (comma-separated).")
 
-MODEL_HIERARCHY = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite"
+GROQ_API_KEYS = [key.strip() for key in GROQ_API_KEYS_STR.split(',') if key.strip()]
+if not GROQ_API_KEYS:
+    raise RuntimeError("GROQ_API_KEYS environment variable is set but contains no valid keys.")
+
+logger.info(f"Loaded {len(GROQ_API_KEYS)} Groq API keys.")
+
+# Models will be tried in this order.
+GROQ_MODEL_HIERARCHY = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768",
 ]
 
-MAX_RETRIES_PER_KEY = 2
-TIMEOUT = 30
-QUOTA_KEYWORDS = ["quota", "exceeded", "rate limit", "403", "too many requests"]
+QUOTA_KEYWORDS = ["quota", "exceeded", "rate limit", "403", "too many requests", "insufficient_quota"]
 
-if not GEMINI_KEYS:
-    raise RuntimeError("No Gemini API keys found. Please set them in your environment.")
+# --- Thread-safe API key rotation for handling concurrent requests ---
+class ApiKeyManager:
+    def __init__(self, api_keys: List[str]):
+        if not api_keys:
+            raise ValueError("API key list cannot be empty.")
+        self._api_keys = itertools.cycle(api_keys)
+        self._lock = threading.Lock()
 
-# -------------------- LLM wrapper --------------------
+    def get_next_key(self) -> str:
+        with self._lock:
+            return next(self._api_keys)
+
+api_key_manager = ApiKeyManager(GROQ_API_KEYS)
+
+
+# -------------------- LLM wrapper with enhanced fallback --------------------
 class LLMWithFallback:
-    def __init__(self, keys=None, models=None, temperature=0):
-        self.keys = keys or GEMINI_KEYS
-        self.models = models or MODEL_HIERARCHY
+    def __init__(self, models=None, temperature=0):
+        self.models = models or GROQ_MODEL_HIERARCHY
         self.temperature = temperature
-        self.slow_keys_log = defaultdict(list)
-        self.failing_keys_log = defaultdict(int)
-        self.current_llm = None # placeholder for actual ChatGoogleGenerativeAI instance
+        self.current_llm = None
 
     def _get_llm_instance(self):
+        """
+        Tries to get a working LLM instance.
+        It iterates through each model. For each model, it tries all available API keys.
+        Only if a model fails with all keys does it move to the next model.
+        """
         last_error = None
+        # Outer loop: Iterate through the model hierarchy
         for model in self.models:
-            for key in self.keys:
+            # Inner loop: For the current model, try all API keys
+            for _ in range(len(GROQ_API_KEYS)):
+                api_key = api_key_manager.get_next_key()
                 try:
-                    llm_instance = ChatGoogleGenerativeAI(
-                        model=model,
+                    llm_instance = ChatGroq(
+                        model_name=model,
                         temperature=self.temperature,
-                        google_api_key=key
+                        groq_api_key=api_key
                     )
+                    # A quick synchronous ping to validate the model and key.
+                    llm_instance.invoke("ping")
                     self.current_llm = llm_instance
+                    logger.info(f"Successfully connected to Groq model: {model} using key ending in ...{api_key[-4:]}")
                     return llm_instance
                 except Exception as e:
                     last_error = e
                     msg = str(e).lower()
+                    key_id = f"key ending in ...{api_key[-4:]}"
                     if any(qk in msg for qk in QUOTA_KEYWORDS):
-                        self.slow_keys_log[key].append(model)
-                    self.failing_keys_log[key] += 1
+                        logger.warning(f"Quota/rate limit issue with model {model} and {key_id}. Trying next key. Error: {e}")
+                    else:
+                        logger.error(f"Failed to initialize model {model} with {key_id}. Trying next key/model. Error: {e}")
                     time.sleep(0.5)
-        raise RuntimeError(f"All models/keys failed. Last error: {last_error}")
+            logger.warning(f"Model {model} failed with all available API keys. Trying next model.")
+
+        raise RuntimeError(f"All configured Groq models failed with all API keys. Last error: {last_error}")
 
     # Required by LangChain agent
     def bind_tools(self, tools):
+        # We get a fresh instance each time to ensure key rotation is effective for new requests.
         llm_instance = self._get_llm_instance()
         return llm_instance.bind_tools(tools)
 
-    # Keep .invoke interface
+    # Keep .invoke interface for direct calls if needed
     def invoke(self, prompt):
         llm_instance = self._get_llm_instance()
         return llm_instance.invoke(prompt)
@@ -340,8 +371,8 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
     Returns dict with parsed JSON or error details.
     """
     # create file content
-    preamble = [
-        "import json, sys, gc",
+    preamble =  preamble = [
+        "import json, sys, gc, os", # Ensure os is here
         "import seaborn as sns",
         "import networkx as nx",
         "import pandas as pd, numpy as np",
@@ -350,18 +381,38 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "import matplotlib.pyplot as plt",
         "from io import BytesIO",
         "import base64",
+        "import duckdb", # NEW: Import duckdb
     ]
+
+    # ---- NEW: Add DuckDB configuration block ----
+    duckdb_config = r'''
+# --- Configure DuckDB to use a local directory for extensions ---
+ext_dir = '/tmp/.duckdb_extensions'
+os.makedirs(ext_dir, exist_ok=True)
+
+# Monkey-patch duckdb.connect to always use our extension directory
+original_connect = duckdb.connect
+def new_connect(*args, **kwargs):
+    config = kwargs.get('config', {})
+    if 'extension_directory' not in config:
+        config['extension_directory'] = ext_dir
+    kwargs['config'] = config
+    return original_connect(*args, **kwargs)
+duckdb.connect = new_connect
+# --- End of DuckDB Configuration ---
+'''
+    preamble.append(duckdb_config)
+    # ----------------------------------------------
+    
     if PIL_AVAILABLE:
         preamble.append("from PIL import Image")
-    # inject df if a pickle path provided
+        
     if injected_pickle:
         preamble.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
         preamble.append("data = df.to_dict(orient='records')\n")
     else:
-        # ensure data exists so user code that references data won't break
         preamble.append("data = globals().get('data', {})\n")
 
-    # plot_to_base64 helper that tries to reduce size under 100_000 bytes
     helper = r'''
 def plot_to_base64(max_bytes=100000):
     buf = BytesIO()
@@ -370,7 +421,6 @@ def plot_to_base64(max_bytes=100000):
     img_bytes = buf.getvalue()
     if len(img_bytes) <= max_bytes:
         return base64.b64encode(img_bytes).decode('ascii')
-    # try decreasing dpi/figure size iteratively
     for dpi in [80, 60, 50, 40, 30]:
         buf = BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=dpi)
@@ -378,7 +428,6 @@ def plot_to_base64(max_bytes=100000):
         b = buf.getvalue()
         if len(b) <= max_bytes:
             return base64.b64encode(b).decode('ascii')
-    # if Pillow available, try convert to WEBP which is typically smaller
     try:
         from PIL import Image
         buf = BytesIO()
@@ -391,7 +440,6 @@ def plot_to_base64(max_bytes=100000):
         ob = out_buf.getvalue()
         if len(ob) <= max_bytes:
             return base64.b64encode(ob).decode('ascii')
-        # try lower quality
         out_buf = BytesIO()
         im.save(out_buf, format='WEBP', quality=60, method=6)
         out_buf.seek(0)
@@ -400,7 +448,6 @@ def plot_to_base64(max_bytes=100000):
             return base64.b64encode(ob).decode('ascii')
     except Exception:
         pass
-    # as last resort return downsized PNG even if > max_bytes
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
     buf.seek(0)
@@ -782,8 +829,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 
 # ---- Configuration for diagnostics (tweak as needed) ----
 DIAG_NETWORK_TARGETS = {
-    "Google AI": "https://generativelanguage.googleapis.com",
-    "AISTUDIO": "https://aistudio.google.com/",
+    "Groq API": "https://api.groq.com",
     "OpenAI": "https://api.openai.com",
     "GitHub": "https://api.github.com",
 }
@@ -791,13 +837,11 @@ DIAG_LLM_KEY_TIMEOUT = 30 # seconds per key/model simple ping test (sync tests r
 DIAG_PARALLELISM = 6       # how many thread workers for sync checks
 RUN_LONGER_CHECKS = False # Playwright/duckdb tests run only if true (they can be slow)
 
-# Use existing GEMINI_KEYS / MODEL_HIERARCHY from your app. If not defined, create empty lists.
+# Use existing GROQ_MODEL_HIERARCHY from your app. If not defined, create empty lists.
 try:
-    _GEMINI_KEYS = GEMINI_KEYS
-    _MODEL_HIERARCHY = MODEL_HIERARCHY
+    _GROQ_MODEL_HIERARCHY = GROQ_MODEL_HIERARCHY
 except NameError:
-    _GEMINI_KEYS = []
-    _MODEL_HIERARCHY = []
+    _GROQ_MODEL_HIERARCHY = []
 
 # helper: iso timestamp
 def _now_iso():
@@ -821,11 +865,20 @@ def _env_check(required=None):
     required = required or []
     out = {}
     for k in required:
-        out[k] = {"present": bool(os.getenv(k)), "masked": (os.getenv(k)[:4] + "..." + os.getenv(k)[-4:]) if os.getenv(k) else None}
-    # Also include simple helpful values
-    out["GOOGLE_MODEL"] = os.getenv("GOOGLE_MODEL")
+        # MODIFIED: Special handling for GROQ_API_KEYS
+        if k == "GROQ_API_KEYS":
+            keys_str = os.getenv(k)
+            if keys_str:
+                keys = [key.strip() for key in keys_str.split(',') if key.strip()]
+                out[k] = {"present": True, "count": len(keys)}
+            else:
+                out[k] = {"present": False, "count": 0}
+        else:
+            out[k] = {"present": bool(os.getenv(k)), "masked": (os.getenv(k)[:4] + "..." + os.getenv(k)[-4:]) if os.getenv(k) else None}
+
     out["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
     return out
+
 
 def _system_info():
     info = {
@@ -908,62 +961,38 @@ def _network_probe_sync(url, timeout=30):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---- LLM key+model light test (sync) ----
-# tries each key for each model with a short per-call timeout (run in threadpool)
-def _test_gemini_key_model(key, model, ping_text="ping"):
+# ---- LLM model light test (sync) ----
+def _test_groq_model(model: str, api_key: str, ping_text="ping"):
     """
-    Test a Gemini API key by sending a minimal request.
+    Test a Groq model with a specific API key.
     Always returns a pure dict with only primitive types.
     """
+    key_id = f"...{api_key[-4:]}"
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_groq import ChatGroq
     except Exception as e:
-        return {"ok": False, "error": f"langchain_google_genai import error: {e}"}
+        return {"ok": False, "error": f"langchain_groq import error: {e}"}
 
     try:
-        obj = ChatGoogleGenerativeAI(
-            model=model,
-            temperature=0,
-            google_api_key=key
-        )
+        obj = ChatGroq(model_name=model, temperature=0, groq_api_key=api_key)
 
         def extract_text(resp):
-            """Normalize any type of LLM response into a clean string."""
             try:
-                if resp is None:
-                    return None
-                if isinstance(resp, str):
-                    return resp
-                if hasattr(resp, "content") and isinstance(resp.content, str):
-                    return resp.content
-                if hasattr(resp, "text") and isinstance(resp.text, str):
-                    return resp.text
-                # For objects with .dict() method
-                if hasattr(resp, "dict"):
-                    try:
-                        return str(resp.dict())
-                    except Exception:
-                        pass
+                if resp is None: return None
+                if isinstance(resp, str): return resp
+                if hasattr(resp, 'content') and isinstance(resp.content, str): return resp.content
+                if hasattr(resp, 'text') and isinstance(resp.text, str): return resp.text
                 return str(resp)
-            except Exception as e:
-                return f"[unreadable response: {e}]"
+            except Exception:
+                return "[unreadable response]"
 
-        # First try invoke()
-        try:
-            resp = obj.invoke(ping_text)
-            text = extract_text(resp)
-            return {"ok": True, "model": model, "summary": text[:200] if text else None}
-        except Exception as e_invoke:
-            # Try __call__()
-            try:
-                resp = obj.__call__(ping_text)
-                text = extract_text(resp)
-                return {"ok": True, "model": model, "summary": text[:200] if text else None}
-            except Exception as e_call:
-                return {"ok": False, "error": f"invoke failed: {e_invoke}; call failed: {e_call}"}
+        resp = obj.invoke(ping_text)
+        text = extract_text(resp)
+        return {"ok": True, "model": model, "key_id": key_id, "summary": text[:200] if text else None}
 
     except Exception as e_outer:
-        return {"ok": False, "error": str(e_outer)}
+        return {"ok": False, "model": model, "key_id": key_id, "error": str(e_outer)}
+
 
 # ---- Async wrappers that call the sync checks in threadpool ----
 async def check_network():
@@ -979,62 +1008,58 @@ async def check_network():
             out[name] = res
     return out
 
-async def check_llm_keys_models():
-    """Try all GEMINI_KEYS on each model (light-touch). Runs in threadpool with per-key timeout."""
-    if not _GEMINI_KEYS:
-        return {"warning": "no GEMINI_KEYS configured"}
+
+async def check_llm_groq_models():
+    """Try a preferred model with all configured API keys."""
+    if not GROQ_API_KEYS:
+        return {"warning": "no GROQ_API_KEYS configured"}
+
+    # We test just the first preferred model with all keys for diagnostics
+    preferred_model = (_GROQ_MODEL_HIERARCHY or ["llama3-8b-8192"])[0]
+
+    tasks = [run_in_thread(_test_groq_model, preferred_model, key, timeout=DIAG_LLM_KEY_TIMEOUT) for key in GROQ_API_KEYS]
+    completed = await asyncio.gather(*tasks, return_exceptions=True)
 
     results = []
-    # we will stop early if we find a working combo but still record attempts
-    for model in (_MODEL_HIERARCHY or ["gemini-2.5-pro"]):
-        # test keys in parallel for this model
-        tasks = []
-        for key in _GEMINI_KEYS:
-            tasks.append(run_in_thread(_test_gemini_key_model, key, model, timeout=DIAG_LLM_KEY_TIMEOUT))
-        completed = await asyncio.gather(*[asyncio.create_task(t) for t in tasks], return_exceptions=True)
-        model_summary = {"model": model, "attempts": []}
-        any_ok = False
-        for key, res in zip(_GEMINI_KEYS, completed):
-            if isinstance(res, Exception):
-                model_summary["attempts"].append({"key_mask": (key[:4] + "..." + key[-4:]) if key else None, "ok": False, "error": str(res)})
-            else:
-                # res is dict returned by _test_gemini_key_model
-                model_summary["attempts"].append({"key_mask": (key[:4] + "..." + key[-4:]) if key else None, **res})
-                if res.get("ok"):
-                    any_ok = True
-        results.append(model_summary)
-        if any_ok:
-            # stop once first model has a working key (respecting MODEL_HIERARCHY)
-            break
-    return {"models_tested": results}
+    for res in completed:
+        if isinstance(res, Exception):
+            results.append({"model": preferred_model, "ok": False, "error": str(res)})
+        else:
+            results.append(res)
+
+    return {"model_tested": preferred_model, "key_results": results}
+
 
 # ---- Optional slow heavy checks (DuckDB, Playwright) ----
 async def check_duckdb():
     try:
         import duckdb
+        import os # Make sure os is imported
+
         def duck_check():
+            # 1. Define a local, writable directory for extensions
+            extension_dir = "./.duckdb_extensions"
+            os.makedirs(extension_dir, exist_ok=True)
+
+            # 2. Connect to the database
             conn = duckdb.connect(":memory:")
+
+            # 3. IMPORTANT: Tell DuckDB where to install extensions
+            conn.execute(f"SET extension_directory = '{extension_dir}'")
+            
+            # 4. Now, install and load the extension
+            conn.execute("INSTALL httpfs; LOAD httpfs;")
+            
+            # Original test can remain
             conn.execute("SELECT 1")
             conn.close()
-            return {"duckdb": True}
+            return {"duckdb_and_httpfs_ok": True}
+            
         return await run_in_thread(duck_check, timeout=30)
     except Exception as e:
         return {"duckdb_error": str(e)}
 
-async def check_playwright():
-    try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            b = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-            page = await b.new_page()
-            await page.goto("about:blank")
-            ua = await page.evaluate("() => navigator.userAgent")
-            await b.close()
-            return {"playwright_ok": True, "ua": ua[:200]}
-    except Exception as e:
-        return {"playwright_error": str(e)}
-
-# ---- Final /diagnose route (concurrent) ----
+# ---- Final /diagnose route (renamed to /summary) ----
 from fastapi import Query
 
 @app.get("/summary")
@@ -1050,14 +1075,14 @@ async def diagnose(full: bool = Query(False, description="If true, run extended 
 
     # prepare tasks
     tasks = {
-        "env": run_in_thread(_env_check, ["GOOGLE_API_KEY", "GOOGLE_MODEL", "LLM_TIMEOUT_SECONDS"], timeout=3),
+        "env": run_in_thread(_env_check, ["GROQ_API_KEYS", "LLM_TIMEOUT_SECONDS"], timeout=3),
         "system": run_in_thread(_system_info, timeout=30),
         "tmp_write": run_in_thread(_temp_write_test, timeout=30),
         "cwd_write": run_in_thread(_app_write_test, timeout=30),
         "pandas": run_in_thread(_pandas_pipeline_test, timeout=30),
         "packages": run_in_thread(_installed_packages_sample, timeout=50),
         "network": asyncio.create_task(check_network()),
-        "llm_keys_models": asyncio.create_task(check_llm_keys_models())
+        "llm_models": asyncio.create_task(check_llm_groq_models())
     }
 
     if full or RUN_LONGER_CHECKS:
