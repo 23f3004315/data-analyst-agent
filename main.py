@@ -73,81 +73,88 @@ GROQ_MODEL_HIERARCHY = [
     "llama3-70b-8192",
     "mixtral-8x7b-32768",
 ]
-
 QUOTA_KEYWORDS = ["quota", "exceeded", "rate limit", "403", "too many requests", "insufficient_quota"]
 
-# --- Thread-safe API key rotation for handling concurrent requests ---
-class ApiKeyManager:
+# --- CHANGED: Simple Thread-safe API key rotation ---
+class SimpleKeyRotator:
     def __init__(self, api_keys: List[str]):
         if not api_keys:
             raise ValueError("API key list cannot be empty.")
-        self._api_keys = itertools.cycle(api_keys)
-        self._lock = threading.Lock()
-
+        self.api_keys = api_keys
+        self.current_index = 0
+        self.lock = threading.Lock()
+        
     def get_next_key(self) -> str:
-        with self._lock:
-            return next(self._api_keys)
+        with self.lock:
+            key = self.api_keys[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.api_keys)
+            return key
 
-api_key_manager = ApiKeyManager(GROQ_API_KEYS)
+api_key_manager = SimpleKeyRotator(GROQ_API_KEYS)
 
-
-# -------------------- LLM wrapper with enhanced fallback --------------------
+# -------------------- CHANGED: LLM wrapper with NO CACHING --------------------
 class LLMWithFallback:
     def __init__(self, models=None, temperature=0):
         self.models = models or GROQ_MODEL_HIERARCHY
         self.temperature = temperature
-        self.current_llm = None
+        # REMOVED: self.current_llm = None  # No more caching!
 
     def _get_llm_instance(self):
         """
-        Tries to get a working LLM instance.
-        It iterates through each model. For each model, it tries all available API keys.
-        Only if a model fails with all keys does it move to the next model.
+        Gets a fresh LLM instance with NO ping validation.
+        Errors will be caught during actual usage.
         """
         last_error = None
-        # Outer loop: Iterate through the model hierarchy
+        
         for model in self.models:
-            # Inner loop: For the current model, try all API keys
             for _ in range(len(GROQ_API_KEYS)):
                 api_key = api_key_manager.get_next_key()
+                
                 try:
                     llm_instance = ChatGroq(
                         model_name=model,
                         temperature=self.temperature,
                         groq_api_key=api_key
                     )
-                    # A quick synchronous ping to validate the model and key.
-                    llm_instance.invoke("ping")
-                    self.current_llm = llm_instance
-                    logger.info(f"Successfully connected to Groq model: {model} using key ending in ...{api_key[-4:]}")
+                    
+                    # NO PING! Just return the instance
+                    logger.info(f"🚀 Created LLM instance: {model} with key ending ...{api_key[-4:]}")
                     return llm_instance
+                    
                 except Exception as e:
                     last_error = e
                     msg = str(e).lower()
                     key_id = f"key ending in ...{api_key[-4:]}"
+                    
                     if any(qk in msg for qk in QUOTA_KEYWORDS):
-                        logger.warning(f"Quota/rate limit issue with model {model} and {key_id}. Trying next key. Error: {e}")
+                        logger.warning(f"⚠️ Rate limit hit - model {model}, {key_id}")
                     else:
-                        logger.error(f"Failed to initialize model {model} with {key_id}. Trying next key/model. Error: {e}")
-                    time.sleep(0.5)
-            logger.warning(f"Model {model} failed with all available API keys. Trying next model.")
+                        logger.error(f"❌ Error with model {model}, {key_id}: {str(e)[:100]}")
+                    
+                    time.sleep(0.2)
+            
+            logger.warning(f"🔄 Model {model} exhausted all keys, trying next model")
+    
+        raise RuntimeError(f"💥 All models failed with all keys. Last error: {last_error}")
 
-        raise RuntimeError(f"All configured Groq models failed with all API keys. Last error: {last_error}")
 
-    # Required by LangChain agent
     def bind_tools(self, tools):
-        # We get a fresh instance each time to ensure key rotation is effective for new requests.
+        """Each call gets a fresh LLM instance with rotated key"""
         llm_instance = self._get_llm_instance()
+        api_key = llm_instance.groq_api_key.get_secret_value()  # ✅ Proper way
+        logger.info(f"🔧 bind_tools() using key ending ...{api_key[-4:]}")
         return llm_instance.bind_tools(tools)
-
-    # Keep .invoke interface for direct calls if needed
+    
     def invoke(self, prompt):
+        """Each call gets a fresh LLM instance with rotated key"""
         llm_instance = self._get_llm_instance()
+        api_key = llm_instance.groq_api_key.get_secret_value()  # ✅ Proper way
+        logger.info(f"🤖 invoke() using key ending ...{api_key[-4:]}")
         return llm_instance.invoke(prompt)
 
 
-LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 240))
 
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 240))
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
@@ -158,6 +165,34 @@ async def serve_frontend():
     except FileNotFoundError:
         return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
 
+# ADDED: Test endpoint for API key rotation verification
+@app.get("/test-rotation")
+async def test_key_rotation():
+    """Test endpoint to verify API key rotation is working"""
+    results = []
+    
+    # Create multiple LLM instances to simulate concurrent requests
+    for i in range(4):
+        try:
+            llm = LLMWithFallback(temperature=0)
+            # This will trigger key rotation
+            llm_instance = llm._get_llm_instance()
+            
+            # Extract the API key being used (for logging only)
+            api_key = llm_instance.groq_api_key
+            results.append({
+                "request": i + 1,
+                "key_ending": api_key[-4:] if api_key else "unknown",
+                "status": "success"
+            })
+        except Exception as e:
+            results.append({
+                "request": i + 1,
+                "error": str(e),
+                "status": "error"
+            })
+    
+    return {"rotation_test": results}
 
 def parse_keys_and_types(raw_questions: str):
     """
@@ -179,9 +214,6 @@ def parse_keys_and_types(raw_questions: str):
     type_map = {key: type_map_def.get(t.lower(), str) for key, t in matches}
     keys_list = [k for k, _ in matches]
     return keys_list, type_map
-
-
-
 
 # -----------------------------
 # Tools
@@ -266,7 +298,6 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
 # -----------------------------
 # Utilities for executing code safely
 # -----------------------------
@@ -279,7 +310,7 @@ def clean_llm_output(output: str) -> Dict:
         if not output:
             return {"error": "Empty LLM output"}
         # remove triple-fence markers if present
-        s = re.sub(r"^```(?:json)?\s*", "", output.strip())
+        s = re.sub(r"^```[^\n]*\n", "", output) # CORRECTED: This line was fixed.
         s = re.sub(r"\s*```$", "", s)
         # find outermost JSON object by scanning for balanced braces
         first = s.find("{")
@@ -328,7 +359,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     tables = pd.read_html(response.text)
 
     if tables:
-        df = tables[0] # Take first table
+        df = tables[0]  # Take first table
         df.columns = [str(c).strip() for c in df.columns]
         
         # Ensure all columns are unique and string
@@ -345,7 +376,7 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
 
         # Try to detect possible "keys" from text like Runtime, Genre, etc.
         detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
-        df = pd.DataFrame([{}]) # start empty
+        df = pd.DataFrame([{}])  # start empty
         for col in detected_cols:
             df[col] = None
 
@@ -359,20 +390,19 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
         }
 '''
 
-
 def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60) -> Dict[str, Any]:
     """
     Write a temp python file which:
-      - provides a safe environment (imports)
-      - loads df/from pickle if provided into df and data variables
-      - defines a robust plot_to_base64() helper that ensures < 100kB (attempts resizing/conversion)
-      - executes the user code (which should populate `results` dict)
-      - prints json.dumps({"status":"success","result":results})
+    - provides a safe environment (imports)
+    - loads df/from pickle if provided into df and data variables
+    - defines a robust plot_to_base64() helper that ensures < 100kB (attempts resizing/conversion)
+    - executes the user code (which should populate `results` dict)
+    - prints json.dumps({"status":"success","result":results})
     Returns dict with parsed JSON or error details.
     """
     # create file content
-    preamble =  preamble = [
-        "import json, sys, gc, os", # Ensure os is here
+    preamble = [
+        "import json, sys, gc, os",  # Ensure os is here
         "import seaborn as sns",
         "import networkx as nx",
         "import pandas as pd, numpy as np",
@@ -381,7 +411,7 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "import matplotlib.pyplot as plt",
         "from io import BytesIO",
         "import base64",
-        "import duckdb", # NEW: Import duckdb
+        "import duckdb",  # NEW: Import duckdb
     ]
 
     # ---- NEW: Add DuckDB configuration block ----
@@ -396,17 +426,17 @@ def new_connect(*args, **kwargs):
     config = kwargs.get('config', {})
     if 'extension_directory' not in config:
         config['extension_directory'] = ext_dir
-    kwargs['config'] = config
+        kwargs['config'] = config
     return original_connect(*args, **kwargs)
 duckdb.connect = new_connect
 # --- End of DuckDB Configuration ---
 '''
     preamble.append(duckdb_config)
     # ----------------------------------------------
-    
+
     if PIL_AVAILABLE:
         preamble.append("from PIL import Image")
-        
+
     if injected_pickle:
         preamble.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
         preamble.append("data = df.to_dict(orient='records')\n")
@@ -472,7 +502,7 @@ def plot_to_base64(max_bytes=100000):
 
     try:
         completed = subprocess.run([sys.executable, tmp_path],
-                                     capture_output=True, text=True, timeout=timeout)
+                                 capture_output=True, text=True, timeout=timeout)
         if completed.returncode != 0:
             # collect stderr and stdout for debugging
             return {"status": "error", "message": completed.stderr.strip() or completed.stdout.strip()}
@@ -493,7 +523,6 @@ def plot_to_base64(max_bytes=100000):
         except Exception:
             pass
 
-
 # -----------------------------
 # LLM agent setup
 # -----------------------------
@@ -501,7 +530,7 @@ llm = LLMWithFallback(temperature=0)
 # -----------------------------
 
 # Tools list for agent (LangChain tool decorator returns metadata for the LLM)
-tools = [scrape_url_to_dataframe] # we only expose scraping as a tool; agent will still produce code
+tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent will still produce code
 
 # Prompt: instruct agent to call the tool and output JSON only
 prompt = ChatPromptTemplate.from_messages([
@@ -528,21 +557,32 @@ You must:
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
-agent = create_tool_calling_agent(
-    llm=llm,
-    tools=[scrape_url_to_dataframe], # let the agent call tools if it wants; we will also pre-process scrapes
-    prompt=prompt
-)
+# REMOVE the global agent creation
+# agent = create_tool_calling_agent(...)  # ❌ Remove this
 
-agent_executor = AgentExecutor(
-    agent=agent,
-    tools=[scrape_url_to_dataframe],
-    verbose=True,
-    max_iterations=3,
-    early_stopping_method="generate",
-    handle_parsing_errors=True,
-    return_intermediate_steps=False
-)
+# REPLACE with a function that creates fresh agents per request
+def create_fresh_agent():
+    """Create a fresh agent with rotated API key for each request"""
+    fresh_llm = LLMWithFallback(temperature=0)
+    
+    agent = create_tool_calling_agent(
+        llm=fresh_llm,
+        tools=[scrape_url_to_dataframe],
+        prompt=prompt
+    )
+    
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=[scrape_url_to_dataframe],
+        verbose=True,
+        max_iterations=3,
+        early_stopping_method="generate",
+        handle_parsing_errors=True,
+        return_intermediate_steps=False
+    )
+    
+    return agent_executor
+
 
 
 # -----------------------------
@@ -560,7 +600,7 @@ async def analyze_data(request: Request):
         data_file = None
 
         for key, val in form.items():
-            if hasattr(val, "filename") and val.filename: # it's a file
+            if hasattr(val, "filename") and val.filename:  # it's a file
                 fname = val.filename.lower()
                 if fname.endswith(".txt") and questions_file is None:
                     questions_file = val
@@ -579,7 +619,6 @@ async def analyze_data(request: Request):
         logger.exception("Initial file parsing failed")
         raise HTTPException(status_code=400, detail=f"Error processing input files: {str(e)}")
 
-
     # TIP: Always return something in the correct JSON structure within the time limit.
     # This helper is now UPDATED to be schema-compliant.
     def _create_schema_compliant_error_response(error_message: str):
@@ -592,17 +631,16 @@ async def analyze_data(request: Request):
 
         error_content = {}
         for key in keys_list:
-            expected_type = type_map.get(key) # Gets the type constructor (e.g., int, float, str)
+            expected_type = type_map.get(key)  # Gets the type constructor (e.g., int, float, str)
 
             if expected_type in [int, float]:
-                error_content[key] = 0 # Use 0 for number types
+                error_content[key] = 0  # Use 0 for number types
             elif expected_type == str:
-                error_content[key] = f"Error: {error_message}" # Use error string for string types
+                error_content[key] = f"Error: {error_message}"  # Use error string for string types
             else:
-                error_content[key] = f"Error: Unknown type for key '{key}'" # Fallback
+                error_content[key] = f"Error: Unknown type for key '{key}'"  # Fallback
 
         return JSONResponse(content=error_content, status_code=200)
-
 
     # Part 2: Core agent execution logic.
     # Any failure in this block will be caught and return a best-effort 200 OK response.
@@ -633,7 +671,7 @@ async def analyze_data(request: Request):
                     if PIL_AVAILABLE:
                         from PIL import Image
                         image = Image.open(BytesIO(content))
-                        image = image.convert("RGB") # ensure RGB format
+                        image = image.convert("RGB")  # ensure RGB format
                         df = pd.DataFrame({"image": [image]})
                     else:
                         raise HTTPException(400, "PIL/Pillow not available for image processing")
@@ -663,7 +701,7 @@ async def analyze_data(request: Request):
                 "3) Use only the uploaded dataset for answering questions.\n"
                 "4) Produce a final JSON object with keys:\n"
                 '   - "questions": [ ... original question strings ... ]\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
+                '   - "code": "..." (Python code that fills `results` with exact question strings as keys)\n'
                 "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
         else:
@@ -672,7 +710,7 @@ async def analyze_data(request: Request):
                 "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
                 "2) Produce a final JSON object with keys:\n"
                 '   - "questions": [ ... original question strings ... ]\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
+                '   - "code": "..." (Python code that fills `results` with exact question strings as keys)\n'
                 "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
 
@@ -721,7 +759,6 @@ async def analyze_data(request: Request):
         logger.exception("analyze_data main logic failed")
         return _create_schema_compliant_error_response(f"An unexpected server error occurred: {str(e)}")
 
-
 def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     """
     Runs the LLM agent and executes code.
@@ -733,7 +770,8 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
         max_retries = 3
         raw_out = ""
         for attempt in range(1, max_retries + 1):
-            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+            fresh_agent_executor = create_fresh_agent()
+            response = fresh_agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
             raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
             if raw_out:
                 break
@@ -774,8 +812,6 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
         logger.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
 
-
-    
 from fastapi.responses import FileResponse, Response
 import base64, os
 
@@ -801,10 +837,7 @@ async def analyze_get_info():
     return JSONResponse({
         "ok": True,
         "message": "Server is running. Use POST /api with 'questions_file' and optional 'data_file'.",
-
     })
-
-
 
 # -----------------------------
 # System Diagnostics
@@ -823,9 +856,9 @@ import psutil
 import shutil
 import tempfile
 import os
-import time 
+import time
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse      
+from fastapi.responses import JSONResponse, HTMLResponse
 
 # ---- Configuration for diagnostics (tweak as needed) ----
 DIAG_NETWORK_TARGETS = {
@@ -833,9 +866,9 @@ DIAG_NETWORK_TARGETS = {
     "OpenAI": "https://api.openai.com",
     "GitHub": "https://api.github.com",
 }
-DIAG_LLM_KEY_TIMEOUT = 30 # seconds per key/model simple ping test (sync tests run in threadpool)
-DIAG_PARALLELISM = 6       # how many thread workers for sync checks
-RUN_LONGER_CHECKS = False # Playwright/duckdb tests run only if true (they can be slow)
+DIAG_LLM_KEY_TIMEOUT = 30  # seconds per key/model simple ping test (sync tests run in threadpool)
+DIAG_PARALLELISM = 6  # how many thread workers for sync checks
+RUN_LONGER_CHECKS = False  # Playwright/duckdb tests run only if true (they can be slow)
 
 # Use existing GROQ_MODEL_HIERARCHY from your app. If not defined, create empty lists.
 try:
@@ -878,7 +911,6 @@ def _env_check(required=None):
 
     out["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
     return out
-
 
 def _system_info():
     info = {
@@ -993,7 +1025,6 @@ def _test_groq_model(model: str, api_key: str, ping_text="ping"):
     except Exception as e_outer:
         return {"ok": False, "model": model, "key_id": key_id, "error": str(e_outer)}
 
-
 # ---- Async wrappers that call the sync checks in threadpool ----
 async def check_network():
     coros = []
@@ -1007,7 +1038,6 @@ async def check_network():
         else:
             out[name] = res
     return out
-
 
 async def check_llm_groq_models():
     """Try a preferred model with all configured API keys."""
@@ -1029,12 +1059,11 @@ async def check_llm_groq_models():
 
     return {"model_tested": preferred_model, "key_results": results}
 
-
 # ---- Optional slow heavy checks (DuckDB, Playwright) ----
 async def check_duckdb():
     try:
         import duckdb
-        import os # Make sure os is imported
+        import os  # Make sure os is imported
 
         def duck_check():
             # 1. Define a local, writable directory for extensions
@@ -1046,15 +1075,15 @@ async def check_duckdb():
 
             # 3. IMPORTANT: Tell DuckDB where to install extensions
             conn.execute(f"SET extension_directory = '{extension_dir}'")
-            
+
             # 4. Now, install and load the extension
             conn.execute("INSTALL httpfs; LOAD httpfs;")
-            
+
             # Original test can remain
             conn.execute("SELECT 1")
             conn.close()
             return {"duckdb_and_httpfs_ok": True}
-            
+
         return await run_in_thread(duck_check, timeout=30)
     except Exception as e:
         return {"duckdb_error": str(e)}
@@ -1087,7 +1116,8 @@ async def diagnose(full: bool = Query(False, description="If true, run extended 
 
     if full or RUN_LONGER_CHECKS:
         tasks["duckdb"] = asyncio.create_task(check_duckdb())
-        tasks["playwright"] = asyncio.create_task(check_playwright())
+        # Note: check_playwright not defined, so commented out
+        # tasks["playwright"] = asyncio.create_task(check_playwright())
 
     # run all concurrently, collect results
     results = {}
@@ -1113,7 +1143,6 @@ async def diagnose(full: bool = Query(False, description="If true, run extended 
 
     report["elapsed_seconds"] = (datetime.utcnow() - started).total_seconds()
     return report
-
 
 if __name__ == "__main__":
     import uvicorn
